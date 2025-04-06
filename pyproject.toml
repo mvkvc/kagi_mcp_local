@@ -1,0 +1,21 @@
+[project]
+name = "kagimcplocal"
+version = "0.1.0"
+authors = []
+description = ""
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]~=1.6.0",
+    "beautifulsoup4>=4.13.3",
+    "playwright>=1.51.0",
+    "python-dotenv>=1.1.0",
+    "pydantic>=2.11.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+kagimcplocal = "kagimcplocal:main"
