@@ -13,9 +13,10 @@ MCP server for Kagi Search using your local browser.
 ```json
 {
   "mcpServers": {
-    "kagi": {
+    "kagi-search": {
       "command": "uvx",
       "args": [
+        "--refresh",
         "--from",
         "git+https://github.com/mvkvc/kagi_mcp_local",
         "kagimcplocal"

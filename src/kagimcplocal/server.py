@@ -1,45 +1,199 @@
-import asyncio
-import logging
-import os
-import subprocess
-import textwrap
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncGenerator
+import os
+import subprocess
+import socket
+from urllib.parse import urlparse
+import asyncio
 
 from bs4 import BeautifulSoup
+from playwright.async_api import Playwright, Browser, BrowserContext, async_playwright
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    async_playwright,
-)
 from pydantic import Field
-
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+import textwrap
 
 load_dotenv()
 
-BROWSER = os.getenv("BROWSER", "/usr/bin/brave-browser")
-CDP_URL = os.getenv("CDP_URL", "http://localhost")
-CDP_PORT = int(os.getenv("CDP_PORT", "9222"))
-PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "5000"))
-RESULTS_MAX = int(os.getenv("RESULTS_MAX", "10"))
-
-SELECTOR_RESULTS = "#layout-v2 > div:nth-child(2)"
+SELECTOR_RESULTS = "#layout-v2"
+SELECTOR_RESULT = "div._0_SRI"
 SELECTOR_TITLE = "a.__sri_title_link"
 SELECTOR_URL = "a.__sri_title_link"
 SELECTOR_SNIPPET = "div.__sri-desc div"
 
-process: subprocess.Popen | None = None
-browser: Browser | None = None
-context: BrowserContext | None = None
+
+class BrowserManager:
+    def __init__(self):
+        self.p: Playwright | None = None
+        self.browser: Browser | None = None
+        self.context: BrowserContext | None = None
+
+    async def startup(
+        self, browser_path: str, cdp_url: str, cdp_port: int, page_timeout: int
+    ):
+        browser_running = False
+        parsed_url = urlparse(cdp_url)
+        hostname = parsed_url.hostname or "localhost"
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                result = sock.connect_ex((hostname, cdp_port))
+                if result == 0:
+                    print(f"Browser already running on {hostname}:{cdp_port}")
+                    browser_running = True
+        except socket.error as e:
+            print(f"Socket check failed: {e}")
+
+        if not browser_running:
+            print(f"Starting new browser instance: {browser_path}")
+            command = [browser_path, f"--remote-debugging-port={cdp_port}"]
+            try:
+                subprocess.Popen(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                await asyncio.sleep(2)
+            except FileNotFoundError:
+                print(f"Error: Browser executable not found at {browser_path}")
+            except Exception as e:
+                print(f"Error starting browser process: {e}")
+
+        self.p = await async_playwright().start()
+        self.browser = await self.p.chromium.connect_over_cdp(
+            f"{cdp_url}:{cdp_port}", timeout=page_timeout * 2
+        )
+        if self.browser.contexts:
+            self.context = self.browser.contexts[0]
+        else:
+            print("Warning: No existing browser context found after connecting.")
+            raise Exception("Failed to get existing browser context.")
+
+    async def shutdown(self):
+        if self.browser:
+            await self.browser.close()
+        if self.p:
+            await self.p.stop()
+
+    @asynccontextmanager
+    async def get_browser_page(self, url: str, page_timeout: int):
+        page = await self.context.new_page()
+        try:
+            await page.goto(url, timeout=page_timeout)
+            yield page
+        finally:
+            await page.close()
+
+    async def fetch_content(self, url: str, page_timeout: int):
+        async with self.get_browser_page(url, page_timeout) as page:
+            content = await page.content()
+            bs = BeautifulSoup(content, "html.parser")
+            text_content = bs.get_text(strip=True)
+            return text_content
+
+    async def fetch_search_results(
+        self, queries: list[str], page_timeout: int, results_max: int
+    ):
+        query_search_results = {}
+        fetch_tasks = []
+        results_to_update = []
+
+        for query in queries:
+            url = f"https://kagi.com/search?q={'+'.join(query.split(' '))}"
+            initial_results_for_query = []
+            results_count_for_query = 0
+
+            try:
+                async with self.get_browser_page(url, page_timeout) as page:
+                    await page.wait_for_selector(SELECTOR_RESULTS)
+                    results_container = await page.query_selector(SELECTOR_RESULTS)
+                    results_elements = await results_container.query_selector_all(
+                        SELECTOR_RESULT
+                    )
+
+                    for result_element in results_elements:
+                        title_element = await result_element.query_selector(
+                            SELECTOR_TITLE
+                        )
+                        title = (
+                            await title_element.inner_text() if title_element else None
+                        )
+                        url_element = await result_element.query_selector(SELECTOR_URL)
+                        url = (
+                            await url_element.get_attribute("href")
+                            if url_element
+                            else None
+                        )
+                        snippet_element = await result_element.query_selector(
+                            SELECTOR_SNIPPET
+                        )
+                        snippet = (
+                            await snippet_element.inner_text()
+                            if snippet_element
+                            else None
+                        )
+
+                        if title and url:
+                            if results_count_for_query >= results_max:
+                                break
+
+                            search_result = SearchResult(
+                                title=title, url=url, snippet=snippet, content=None
+                            )
+                            initial_results_for_query.append(search_result)
+
+                            task = asyncio.create_task(
+                                self.fetch_content(url, page_timeout)
+                            )
+                            fetch_tasks.append(task)
+                            results_to_update.append(search_result)
+                            results_count_for_query += 1
+
+                query_search_results[query] = initial_results_for_query
+
+            except Exception as e:
+                print(f"Error {e} fetching initial search results for {query}")
+                query_search_results[query] = []
+
+        if fetch_tasks:
+            try:
+                fetched_contents = await asyncio.gather(
+                    *fetch_tasks, return_exceptions=True
+                )
+                for i, content_or_exception in enumerate(fetched_contents):
+                    if isinstance(content_or_exception, Exception):
+                        print(
+                            f"Error fetching content for {results_to_update[i].url}: {content_or_exception}"
+                        )
+                        results_to_update[
+                            i
+                        ].content = f"Error fetching content: {content_or_exception}"
+                    else:
+                        results_to_update[i].content = content_or_exception
+            except Exception as e:
+                print(f"Error during content fetching: {e}")
+                for result in results_to_update:
+                    if result.content is None:
+                        result.content = f"Error gathering content: {e}"
+
+        return query_search_results
+
+
+@asynccontextmanager
+async def lifespan(app: FastMCP):
+    app.BROWSER = os.getenv("BROWSER", "/usr/bin/brave-browser")
+    app.CDP_URL = os.getenv("CDP_URL", "http://localhost")
+    app.CDP_PORT = int(os.getenv("CDP_PORT", "9222"))
+    app.PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "30000"))
+    app.RESULTS_MAX = int(os.getenv("RESULTS_MAX", "10"))
+    app.CONTENT_CHAR_LIMIT = int(os.getenv("CONTENT_CHAR_LIMIT", "0"))
+    app.browser_manager = BrowserManager()
+    await app.browser_manager.startup(
+        app.BROWSER, app.CDP_URL, app.CDP_PORT, app.PAGE_TIMEOUT
+    )
+    yield
+    await app.browser_manager.shutdown()
 
 
 @dataclass
@@ -48,80 +202,6 @@ class SearchResult:
     url: str
     snippet: str | None = None
     content: str | None = None
-
-
-@asynccontextmanager
-async def get_browser_page(
-    context: BrowserContext, url: str
-) -> AsyncGenerator[Page, None]:
-    logger.debug(f"Opening new page for URL: {url}")
-    page = await context.new_page()
-    try:
-        await page.goto(url, timeout=PAGE_TIMEOUT)
-        logger.debug(f"Successfully navigated to {url}")
-        yield page
-    finally:
-        logger.debug("Closing page")
-        await page.close()
-
-
-async def fetch_content(context: BrowserContext, url: str) -> str:
-    logger.debug(f"Fetching content from {url}")
-    async with get_browser_page(context, url) as page:
-        content = await page.content()
-        bs = BeautifulSoup(content, "html.parser")
-        text_content = bs.get_text(strip=True)
-        logger.debug(f"Successfully fetched and parsed content from {url}")
-        return text_content
-
-
-@asynccontextmanager
-async def lifespan(_: FastMCP):
-    global process, browser, context
-    browser_running = (
-        subprocess.run(
-            [
-                "pgrep",
-                "-f",
-                f"{BROWSER.split('/')[-1]}.*remote-debugging-port={CDP_PORT}",
-            ],
-            capture_output=True,
-            text=True,
-        ).returncode
-        == 0
-    )
-
-    if not browser_running:
-        logger.info(f"Starting browser process with CDP port {CDP_PORT}")
-        process = subprocess.Popen(
-            f'"{BROWSER}" --remote-debugging-port={CDP_PORT}',
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    else:
-        logger.info("Browser already running with CDP enabled")
-
-    try:
-        logger.info("Connecting to browser via CDP")
-        async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(
-                f"{CDP_URL}:{CDP_PORT}", timeout=PAGE_TIMEOUT
-            )
-            context = browser.contexts[0]
-            logger.info("Successfully connected to browser")
-            yield context
-    except Exception as e:
-        logger.error(f"Error during browser connection: {str(e)}")
-        raise
-    finally:
-        logger.info("Cleaning up browser resources")
-        if context:
-            await context.close()
-        if browser:
-            await browser.close()
-        if process:
-            process.kill()
 
 
 mcp = FastMCP(
@@ -144,84 +224,34 @@ async def kagi_search_fetch(
     ),
 ) -> str:
     """Fetch web results based on one or more queries using the Kagi Search API. Use for general search and when the user explicitly tells you to 'fetch' results/information. Results are from all queries given. They are numbered continuously, so that a user may be able to refer to a result by a specific number."""
+
+    app = mcp
+
+    if (
+        not app.browser_manager.context
+        or not app.browser_manager.browser.is_connected()
+    ):
+        return "Search error: browser is not connected or context is unavailable."
+
+    if not queries:
+        return "Search error: called with no queries."
+
     try:
-        if not queries:
-            raise ValueError("Search called with no queries.")
-
-        logger.info(f"Starting search with {len(queries)} queries")
-        search_results = {query: [] for query in queries}
-
-        for query in queries:
-            url = f"https://kagi.com/search?q={'+'.join(query.split(' '))}"
-            logger.info(f"Processing query: {query}")
-
-            try:
-                async with get_browser_page(context, url) as page:
-                    await page.wait_for_selector(SELECTOR_RESULTS, timeout=PAGE_TIMEOUT)
-                    result_elements = await page.query_selector_all(SELECTOR_RESULTS)
-                    logger.info(
-                        f"Found {len(result_elements)} results for query: {query}"
-                    )
-
-                    for idx, result in enumerate(result_elements[:RESULTS_MAX]):
-                        try:
-                            url_element = await result.query_selector(SELECTOR_URL)
-                            url = (
-                                await url_element.get_attribute("href")
-                                if url_element
-                                else None
-                            )
-                            title_element = await result.query_selector(SELECTOR_TITLE)
-                            title = (
-                                await title_element.inner_text()
-                                if title_element
-                                else None
-                            )
-                            snippet_element = await result.query_selector(
-                                SELECTOR_SNIPPET
-                            )
-                            snippet = (
-                                await snippet_element.inner_text()
-                                if snippet_element
-                                else None
-                            )
-
-                            if url and title:
-                                search_results[query].append(
-                                    SearchResult(
-                                        title=title,
-                                        url=url,
-                                        snippet=snippet,
-                                    )
-                                )
-                                logger.debug(f"Processed result {idx + 1}: {title}")
-                            else:
-                                logger.warning(
-                                    f"Skipping result {idx + 1} due to missing title or URL"
-                                )
-                        except Exception as e:
-                            logger.error(f"Error processing result {idx + 1}: {str(e)}")
-                            continue
-            except Exception as e:
-                logger.error(f"Error processing query '{query}': {str(e)}")
-                continue
-
-        logger.info("Fetching content for all results")
-        for query, results in search_results.items():
-            await asyncio.gather(
-                *[fetch_content(context, result.url) for result in results]
-            )
-
-        logger.info("Search completed successfully")
-        return format_search_results(search_results)
-
+        query_search_results = await app.browser_manager.fetch_search_results(
+            queries, app.PAGE_TIMEOUT, app.RESULTS_MAX
+        )
     except Exception as e:
-        logger.error(f"Fatal search error: {str(e)}")
-        return f"Search error: {str(e)}"
+        return f"Error: {str(e) or repr(e)}"
+
+    if not query_search_results:
+        return "No results found."
+
+    return format_search_results(query_search_results, app.CONTENT_CHAR_LIMIT)
 
 
-def format_search_results(search_results: dict[str, list[SearchResult]]) -> str:
-    logger.debug("Formatting search results")
+def format_search_results(
+    search_results: dict[str, list[SearchResult]], content_char_limit: int
+) -> str:
     result_template = textwrap.dedent("""
         {result_number}: {title}
         URL: {url}
@@ -236,28 +266,55 @@ def format_search_results(search_results: dict[str, list[SearchResult]]) -> str:
     """).strip()
 
     formatted_queries = []
-    result_counter = 1
 
     for query, results in search_results.items():
         formatted_results = []
+        result_counter = 1
 
         for result in results:
-            display_content = result.content or result.snippet or "No content available"
+            snippet_display = result.snippet or "No snippet available."
+            content_display = "No content fetched."
+            if result.content:
+                if result.content.startswith(
+                    "Error fetching content:"
+                ) or result.content.startswith("Error gathering content:"):
+                    content_display = result.content
+                else:
+                    cleaned_content = " ".join(result.content.split())
+                    if (
+                        content_char_limit > 0
+                        and len(cleaned_content) > content_char_limit
+                    ):
+                        content_display = cleaned_content[:content_char_limit] + "..."
+                    else:
+                        content_display = cleaned_content
+
             formatted_results.append(
                 result_template.format(
                     result_number=result_counter,
                     title=result.title,
                     url=result.url,
-                    display_content=display_content,
+                    snippet=snippet_display,
+                    display_content=content_display,
                 )
             )
             result_counter += 1
 
-        formatted_queries.append(
-            query_template.format(
-                query=query, formatted_results="\n\n".join(formatted_results)
+        if not formatted_results:
+            formatted_queries.append(
+                query_template.format(
+                    query=query, formatted_results="No results found for this query."
+                )
             )
-        )
+        else:
+            formatted_queries.append(
+                query_template.format(
+                    query=query, formatted_results="\n\n".join(formatted_results)
+                )
+            )
+
+    if not formatted_queries:
+        return "No results found for any query."
 
     return "\n\n".join(formatted_queries)
 
