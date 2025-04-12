@@ -31,13 +31,13 @@ async def main():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=int(os.getenv("PAGE_TIMEOUT", "10000")),
+        default=int(os.getenv("PAGE_TIMEOUT", "30000")),
         help="Page load timeout in milliseconds.",
     )
     parser.add_argument(
         "--max-results",
         type=int,
-        default=int(os.getenv("RESULTS_MAX", "10")),
+        default=int(os.getenv("RESULTS_MAX", "5")),
         help="Maximum number of search results per query.",
     )
     parser.add_argument(

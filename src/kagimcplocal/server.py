@@ -186,7 +186,7 @@ async def lifespan(app: FastMCP):
     app.CDP_URL = os.getenv("CDP_URL", "http://localhost")
     app.CDP_PORT = int(os.getenv("CDP_PORT", "9222"))
     app.PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "30000"))
-    app.RESULTS_MAX = int(os.getenv("RESULTS_MAX", "10"))
+    app.RESULTS_MAX = int(os.getenv("RESULTS_MAX", "5"))
     app.CONTENT_CHAR_LIMIT = int(os.getenv("CONTENT_CHAR_LIMIT", "0"))
     app.browser_manager = BrowserManager()
     await app.browser_manager.startup(

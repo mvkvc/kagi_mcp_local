@@ -25,8 +25,8 @@ MCP server for Kagi Search using your local browser.
         "BROWSER": "/usr/bin/brave-browser",
         "CDP_URL": "http://localhost",
         "CDP_PORT": "9222",
-        "RESULTS_MAX": "10",
-        "PAGE_TIMEOUT": "5000"
+        "RESULTS_MAX": "5",
+        "PAGE_TIMEOUT": "30000"
       }
     }
   }
